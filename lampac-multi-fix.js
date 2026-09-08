@@ -1,58 +1,82 @@
 (function () {
     'use strict';
-    var GUARD = '__lampac_multi_fix_v2';
+
+    var GUARD = '__lampac_multi_fix_v3';
     if (window[GUARD]) return;
     window[GUARD] = true;
-    var handlerCounter = 0;
-    function applyPatch() {
-        var _origFollow = Lampa.Listener.follow;
-        Lampa.Listener.follow = function (type, fn) {
-            if (type !== 'full') {
-                return _origFollow.apply(this, arguments);
+
+    // Fix 1: window.lampac_plugin guard
+    // Both plugins check: if (!window.lampac_plugin) startPlugin();
+    // The first plugin sets it to true — the second never runs startPlugin at all.
+    // Solution: make the property always return undefined (falsy)
+    // so every plugin always runs its own startPlugin.
+    try {
+        Object.defineProperty(window, 'lampac_plugin', {
+            get: function () { return undefined; },
+            set: function () {},
+            configurable: true
+        });
+    } catch (e) {}
+
+    // Fix 2: .lampac--button CSS guard
+    // Both plugins check: if (render.find('.lampac--button').length) return;
+    // Patch Lampa.Listener.send (the internal dispatcher) so during a 'full'
+    // event all handlers see zero existing lampac--buttons and each adds its own.
+    // This is order-independent: works regardless of when plugins registered.
+    var seenNodes = new WeakSet();
+
+    function patchSend(listener) {
+        var _orig = listener.send;
+
+        listener.send = function (type, data) {
+            if (type !== 'full' || !data || data.type !== 'complite') {
+                return _orig.apply(this, arguments);
             }
-            var handlerId = ++handlerCounter;
-            var processedNodes = new WeakSet();
-            var wrappedHandler = function (e) {
-                if (!e || e.type !== 'complite') {
-                    return fn.call(this, e);
+
+            // Identify the render anchor so we can prevent duplicate buttons
+            // if the same 'full' event fires more than once for the same DOM node.
+            var anchor = null;
+            try { anchor = data.object.activity.render().find('.view--torrent')[0]; } catch (_) {}
+            if (!anchor) try { anchor = data.object.activity.render()[0]; } catch (_) {}
+
+            // Already processed this exact render — let handlers run normally
+            // (each will find its own button and exit early as intended).
+            if (anchor && seenNodes.has(anchor)) {
+                return _orig.apply(this, arguments);
+            }
+
+            // During this dispatch, hide all .lampac--button elements from $.fn.find
+            // so every handler believes no button exists yet and adds its own.
+            var _origFind = $.fn.find;
+            $.fn.find = function (sel) {
+                if (typeof sel === 'string' && sel.trim() === '.lampac--button') {
+                    return $([]);
                 }
-                var anchorNode = null;
-                try {
-                    anchorNode = e.object.activity.render().find('.view--torrent')[0];
-                } catch (_) {}
-                if (!anchorNode) {
-                    try { anchorNode = e.object.activity.render()[0]; } catch (_) {}
-                }
-                if (anchorNode && processedNodes.has(anchorNode)) {
-                    return fn.call(this, e);
-                }
-                var _origFind = $.fn.find;
-                $.fn.find = function (selector) {
-                    if (typeof selector === 'string' && selector.trim() === '.lampac--button') {
-                        return $([]);
-                    }
-                    return _origFind.apply(this, arguments);
-                };
-                try {
-                    fn.call(this, e);
-                } finally {
-                    $.fn.find = _origFind;
-                    if (anchorNode) {
-                        processedNodes.add(anchorNode);
-                    }
-                }
+                return _origFind.apply(this, arguments);
             };
-            return _origFollow.call(this, 'full', wrappedHandler);
+
+            try {
+                var result = _orig.apply(this, arguments);
+                if (anchor) seenNodes.add(anchor);
+                return result;
+            } finally {
+                $.fn.find = _origFind;
+            }
         };
     }
-    if (window.Lampa && window.Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
-        applyPatch();
-    } else {
-        var _waitTimer = setInterval(function () {
-            if (window.Lampa && window.Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
-                clearInterval(_waitTimer);
-                applyPatch();
-            }
+
+    function init() {
+        if (!window.Lampa || !Lampa.Listener || typeof Lampa.Listener.send !== 'function') {
+            return false;
+        }
+        patchSend(Lampa.Listener);
+        return true;
+    }
+
+    if (!init()) {
+        var _t = setInterval(function () {
+            if (init()) clearInterval(_t);
         }, 50);
     }
+
 })();
